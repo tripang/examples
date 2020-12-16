@@ -1,0 +1,149 @@
+<?php
+
+namespace App\Service\Ticket\Quality;
+
+use Carbon\Carbon;
+use Expansion\Tickets\Tickets\Classifier\Tip;
+use Expansion\Tickets\Tickets\Models\Ticket;
+use Expansion\Tickets\Tickets\Models\TicketAction;
+use Expansion\Tickets\Tickets\Models\TicketStatus;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Collection;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+/**
+ * Class QualityService
+ *
+ * @package App\Service\Ticket\Quality
+ */
+class QualityService
+{
+    /**
+     * @todo move to app/Service/Ticket/Quality
+     * @param int $departmentId
+     * @param Carbon $date
+     * @return Ticket[]|Builder[]|Collection|\Illuminate\Database\Query\Builder[]|\Illuminate\Support\Collection
+     */
+    public static function getQualityDetails(int $departmentId, Carbon $date)
+    {
+        $date = $date->firstOfMonth();
+        $tickets = self::tickets($departmentId, $date);
+        $repeatedTickets = Repeated::repeatedTickets($tickets, $date);
+
+        return $tickets->map(function ($ticket) use ($repeatedTickets) {
+            // todo move wrong and repeated order to front
+            $isWrong = $ticket->departmentPeriods->filter(function ($period) {
+                return $period->is_wrong;
+            })->count();
+
+            $isWrongConfirmed = $isWrong
+                && $ticket->departmentPeriods->filter(function ($period) {
+                    return $period->is_wrong_confirmed;
+                })->count();
+
+            $repeated_tickets = isset($repeatedTickets[$ticket->id]) ?
+                array_values($repeatedTickets[$ticket->id]) : [];
+            $isRepeated = count($repeated_tickets) > 0;
+
+            $isWithoutChanges = $ticket->repeated->count() === 0;
+            $isLastConfirmed = $ticket->repeated->count() > 0
+                && $ticket->repeated->first()->repeated->is_confirmed;
+
+            $isRepeatedConfirmed = $isRepeated && ($isWithoutChanges || $isLastConfirmed);
+
+            $isSubscriber = $ticket->subscriber;
+
+            return [
+                'id' => $ticket->id,
+                'subscriber_name' => $isSubscriber ? $ticket->subscriber->full_name : '',
+                'subscriber_id' => $isSubscriber ? $ticket->subscriber->id : '',
+                'created_at' => $ticket->created_at->format('Y-m-d H:i:s'),
+                'category' => $ticket->steps->implode('name', ''),
+                'steps' => $ticket->steps->map(function ($step) {
+                    return $step->name;
+                }),
+                'author_name' => $ticket->departmentPeriods->first()->user->name,
+                'author_id' => $ticket->departmentPeriods->first()->user_id,
+                'is_wrong_sort' => $isWrongConfirmed ? 1 : ($isWrong ? 2 : 3),
+                'department_periods' => self::departmentPeriods($ticket),
+                'is_repeated_sort' => $isRepeatedConfirmed ? 1 : ($isRepeated ? 2 : 3),
+                'repeated' => array_map(function ($repeated_ticket) use ($ticket) {
+                    return  $repeated_ticket->id;
+                }, $repeated_tickets),
+                'is_repeated_confirmed' => $isRepeatedConfirmed,
+                'timeline' => self::timeline($ticket),
+            ];
+        });
+    }
+
+    /**
+     * @todo move to Model
+     * @param int $departmentId
+     * @param Carbon $date
+     */
+    private static function tickets(int $departmentId, Carbon $date): Collection
+    {
+        return Ticket::where('ticket_status_id', TicketStatus::STATUS_COMPLETED)
+            ->where('tip_id', Tip::TIP_SIMPLE)
+            ->whereHas('actions', function (Builder $q) use ($departmentId) {
+                $q->where('type', '=', 'move_to_department')
+                    ->whereHas('department', function (Builder $q) use ($departmentId) {
+                        $q->where('department_id', '=' , $departmentId);
+                    });
+            })
+            ->whereHas('actions', function (Builder $q) use ($date) {
+                $q->whereMonth('created_at', '=', $date->month)
+                    ->whereHas('status', function (Builder $q) {
+                        $q->where('status_id', '=', TicketStatus::STATUS_COMPLETED);
+                    });
+            })
+            ->with('subscriber', 'steps')
+            ->with(['userPeriods' => function (HasMany $q) {
+                $q->with('user');
+            }])
+            ->with(['departmentPeriods' => function (HasMany $q) {
+                $q->with('department', 'user');
+            }])
+            ->with(['repeated' => function(HasMany $q) {
+                $q->where('type', TicketAction::TYPE_REPEATED)
+                    ->orderByDesc('created_at')
+                    ->with('repeated');
+            }])
+            ->get();
+    }
+
+    /**
+     * @param Ticket $ticket
+     * @return Collection
+     */
+    private static function departmentPeriods(Ticket $ticket): Collection
+    {
+        return $ticket->departmentPeriods->map(function ($period) {
+            return [
+                'department_id' => $period->department_id,
+                'action_id' => $period->id,
+                'is_wrong' => $period->is_wrong,
+                'is_wrong_confirmed' => $period->is_wrong_confirmed,
+                'user_id' => $period->user_id,
+                'user_name' => $period->user ? $period->user->name : 'Система',
+                'time' => $period->time * 1
+            ];
+        });
+    }
+
+    /**
+     * @param Ticket $ticket
+     * @return Collection
+     */
+    private static function timeline(Ticket $ticket): Collection
+    {
+        return $ticket->userPeriods->map(function ($period) {
+            return [
+                'time' => $period->time * 1,
+                'department_id' => $period->department_id,
+                'user_id' => $period->user_id,
+                'user_name' => $period->user ? $period->user->name : 'Система',
+            ];
+        });
+    }
+}
