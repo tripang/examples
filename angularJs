@@ -1,0 +1,467 @@
+(function () {
+    'use strict';
+
+    /**
+        Cart
+        {
+            parts: {
+                '1-1-111' : {
+                    partId: '1-1-111'
+                    name: 'Полиуретановая втулка стабилизатора, передней подвески I.D. = 28 мм (2 шт. в упаковке)',
+                    queryTypeId: 1,
+                    queryResult: '1-1-111',
+                    quantity: 5, // всего
+                    initQty: // начальное значение
+                    maxQty: // максимальное значение
+                    price: 100500,
+                    isDeleted: false,
+                    orders: {
+                        orderTypeInStock: 0, //штуки
+                        orderTypeMoscow:
+                        orderTypeSgp:
+                        orderTypeFactory:
+                    },
+                '1-1-112': {
+                    ...
+                }
+            checked: {
+                orderTypeInStock: true,
+                ...
+            }
+        }
+     */
+    angular.module('app').factory('Cart', ['GlobalStorage', 'Funcs', 'Restangular', 'Conf', 'WarehouseStock', 'User',
+        function (GlobalStorage, Funcs, Restangular, Conf, WarehouseStock, User) {
+            var service = {};
+
+            service.sync = function () {
+                var gl = GlobalStorage.local();
+                var tempOptCart = gl.tempOptCart;
+
+                if (tempOptCart === undefined) {
+                    return;
+                }
+
+                gl.tempOptCart = undefined;
+                GlobalStorage.local(gl);
+
+                var parts = {};
+                var part;
+                var newPart;
+
+                for (var k in tempOptCart) { if (tempOptCart.hasOwnProperty(k)) {
+                    part = tempOptCart[k];
+                    newPart = {
+                        description: part.description,
+                        partId: part.part,
+                        price: part.price.optValue,
+                        priceRetail: part.price.retail,
+                        quantity: part.qty,
+                        isProduce: part.isProduce,
+                        queryResult: part.part,
+                        qtyInPack: part.qtyInPack,
+                        queryTypeId: 1
+                    };
+                    parts[part.part] = newPart;
+                }}
+
+                service.add(parts);
+            };
+
+            service.get = function () {
+                // todo update stocks
+                return GlobalStorage.local().optCart || {};
+            };
+
+            service.total = function () {};
+
+            service.setDeliveryTimeAndPacksQtyMax = function (parts, isCart) {
+                for (var k in parts) { if (parts.hasOwnProperty(k)) {
+                    if (parts[k].part !== undefined) {
+                        parts[k].deliveryTime = service.getDeliveryTime(
+                            parts[k].part,
+                            service.getAllOrdersPartQuantity(parts[k].part) + 1, // т.к. нужен срок для следующей детали
+                            parts[k].qtyInPack,
+                            !(parts[k].isProduce === false || parts[k].isProduce === 0)
+                        );
+                    }
+                }}
+
+                return parts;
+            };
+
+            /**
+             * part = {
+             *      part: '1-0-123'
+             * }
+             * @param part
+             * @returns {*}
+             */
+            service.inCartPacksQty = function (part) {
+                return service.getAllOrdersPartQuantity(part.part) / part.qtyInPack;
+            };
+
+            /**
+             * parts {
+             *      partId: {
+             *          description: "Полиуретановый сайлентблок передней подвески, верхнего рычага, передний",
+             *          partId: "1-06-861",
+             *          price: 630.00,
+             *          quantity: 6,
+             *          queryResult: "48632-28050",
+             *          queryTypeId: 2
+             *      }
+             * }
+             *
+             * @param {object} data
+             * @param {function} callback
+             */
+            service.add = function(data, callback) {
+                var parts = convertToParts(data);
+                var partIdList = [];
+                for (var partId in parts) { if (parts.hasOwnProperty(partId)) {
+                    partIdList.push(partId);
+                }}
+                WarehouseStock.update(partIdList, function() {
+                    service.addParts(parts);
+                    if (callback !== undefined) {
+                        callback();
+                    }
+                });
+            };
+
+            /**
+             * return {part.id: {
+                    description: part.description,
+                    partId: part.part,
+                    price: part.price.optValue,
+                    quantity: part.qtyInPack,
+                    queryResult: part.part,
+                    queryTypeId: Conf.orderItemQueryTypePart
+                };
+             *
+             * @param {object} data
+             * @returns {object}
+             */
+            function convertToParts(data) {
+                var isParts = data.description === undefined;
+                if (isParts) {
+                    return data;
+                }
+                var part = data;
+                var partForOptCart = {};
+                partForOptCart[part.part] = {
+                    description: part.description,
+                    partId: part.part,
+                    price: part.price.optValue,
+                    priceRetail: part.price.retail,
+                    quantity: part.quantity,
+                    qtyInPack: part.qtyInPack,
+                    queryResult: part.part,
+                    isProduce: !(part.isProduce === false || part.isProduce === 0),
+                    queryTypeId: Conf.orderItemQueryTypePart,
+                    weight: part.weight
+                };
+                return partForOptCart;
+            }
+
+            /**
+             *
+             * @param {object} part
+             * @param {function} callback
+             */
+            service.setPart = function(part, callback) {
+                WarehouseStock.update([part.partId], function() {
+                    service.updatePartInOrders(part);
+                    callback();
+                });
+            };
+
+            /**
+             * @param {string} partId
+             * @returns {number} quantity
+             */
+            service.getAllOrdersPartQuantity = function(partId) {
+                var cart = GlobalStorage.local().optCart;
+
+                if (cart === undefined || cart.parts[partId] === undefined) {
+                    return 0;
+                }
+
+                var quantity = 0;
+
+                var orders = cart.parts[partId].orders;
+                for (var orderType in orders) { if (orders.hasOwnProperty(orderType)) {
+                    quantity += +orders[orderType];
+                }}
+                return quantity;
+            };
+
+            /**
+             * @param {string} orderType
+             * @returns {number} quantity
+             */
+            service.getOrderSum = function(orderType) {
+                var cart = GlobalStorage.local().optCart;
+
+                if (cart === undefined) {
+                    return 0;
+                }
+                var sum = 0;
+
+                var parts = cart.parts;
+                for (var partId in parts) { if (parts.hasOwnProperty(partId)) {
+                    var quant = parts[partId].orders[orderType] || 0;
+                    sum += (parts[partId].price || 0) * quant;
+                }}
+
+                return sum;
+            };
+
+            service.toogleCheck = function (orderType) {
+                var cart = service.get();
+                cart.checks[orderType] = !cart.checks[orderType];
+                if (cart.checks[orderType]) {
+                    if (orderType === Conf.orderTypeMoscow) {
+                        cart.checks[Conf.orderTypeInStock] = true;
+                    }
+                    if (orderType === Conf.orderTypeSgp) {
+                        cart.checks[Conf.orderTypeInStock] = true;
+                        cart.checks[Conf.orderTypeMoscow] = true;
+                    }
+                    if (orderType === Conf.orderTypeFactory) {
+                        cart.checks[Conf.orderTypeInStock] = true;
+                        cart.checks[Conf.orderTypeMoscow] = true;
+                        cart.checks[Conf.orderTypeSgp] = true;
+                    }
+                }
+
+                if (!cart.checks[orderType]) {
+                    if (orderType === Conf.orderTypeInStock) {
+                        cart.checks[Conf.orderTypeMoscow] = false;
+                        cart.checks[Conf.orderTypeSgp] = false;
+                        cart.checks[Conf.orderTypeFactory] = false;
+                    }
+                    if (orderType === Conf.orderTypeMoscow) {
+                        cart.checks[Conf.orderTypeSgp] = false;
+                        cart.checks[Conf.orderTypeFactory] = false;
+                    }
+                    if (orderType === Conf.orderTypeSgp) {
+                        cart.checks[Conf.orderTypeFactory] = false;
+                    }
+                }
+            };
+
+
+            /****************** private ******************/
+
+            /**
+             *
+             * @param partId
+             * @param qty
+             * @param qtyInPack
+             * @param isProduce
+             * @returns int
+             */
+            service.getDeliveryTime = function (partId, qty, qtyInPack, isProduce=1) {
+                var userWarehouse = User.get().warehouseId;
+
+                var remain = checkWarehouseStock(userWarehouse, partId, qty, qtyInPack);
+                if (remain.qty <= 0) {
+                    return remain.deliveryTime;
+                }
+
+                if (service.isFedFromMoscow(userWarehouse)) {
+                    remain = checkWarehouseStock(Conf.warehouseMoscow, partId, remain.qty, qtyInPack);
+                    if (remain.qty <= 0) {
+                        return remain.deliveryTime;
+                    }
+                }
+
+                remain = checkWarehouseStock(Conf.warehouseSgp, partId, remain.qty, qtyInPack);
+                if (remain.qty <= 0) {
+                    return remain.deliveryTime;
+                }
+
+                return (isProduce === 0)?-1:45; // время производства
+
+                /**
+                 *
+                 * @param warehouseId
+                 * @param partId
+                 * @param qty
+                 * @param qtyInPack
+                 * @returns {{deliveryTime: (int), qty: int}}
+                 */
+                function checkWarehouseStock(warehouseId, partId, qty, qtyInPack) {
+                    var stock = WarehouseStock.get(partId, warehouseId);
+                    var isEqual = qty === stock.stock;
+
+                    qty = Math.ceil(qty/qtyInPack) * qtyInPack;
+
+                    return {
+                        deliveryTime: stock.deliveryTime,
+                        qty: isEqual ? 0 : qty - stock.stock
+                    }
+                }
+            };
+
+            service.addParts = function(parts) {
+                for (var partId in parts) { if (parts.hasOwnProperty(partId)) {
+                    var part = parts[partId];
+                    var inCart = service.getAllOrdersPartQuantity(part.partId);
+                    part.quantity = +inCart + +part.quantity;
+                    service.updatePartInOrders(part);
+
+                }}
+
+                // todo обновитьКорзинуНаСервере();
+            };
+
+            /**
+             * {
+             *      partId,
+             *      description,
+             *      quantity,
+             *      price,
+             *      queryTypeId,
+             *      queryResult,
+             * }
+             *
+             * @param part
+             */
+            service.updatePartInOrders = function (part) {
+                var dbPart = angular.copy(part);
+                if (part.isProduce !== 0){
+                    service.updatePartBackend(dbPart);
+                }
+
+                var remain = service.addPartToOrder(part, Conf.orderTypeInStock);
+
+                if (service.isFedFromMoscow()) {
+                    part.quantity = remain > 0 ? remain : 0;
+                    remain = service.addPartToOrder(part, Conf.orderTypeMoscow);
+                }
+
+                part.quantity = remain > 0 ? remain : 0;
+                remain = service.addPartToOrder(part, Conf.orderTypeSgp);
+
+                part.quantity = remain > 0 ? remain : 0;
+                service.addPartToOrder(part, Conf.orderTypeFactory);
+
+                if (part.isProduce === 0){
+                    if (remain > 0){
+                        dbPart.quantity -= +remain;
+                    }
+                    service.updatePartBackend(dbPart);
+                }
+            };
+
+            service.updatePartBackend = function (part) {
+                var addPart = {
+                    partId: part.partId,
+                    price: part.price,
+                    queryTypeId: 1,
+                    queryResult: part.description,
+                    qty: part.quantity
+                };
+                Restangular.all('changeparts').post(addPart).then(function () {});
+            };
+
+            /**
+             * Добавить деталь в один из заказов оптовой корзины
+             *      наСкладе = деталь.наСкладе[склад]
+             *
+             *      Заказ.детали[деталь]  = наСкладе < кРазмещению ?
+             *          наСкладе : кРазмещению
+             *
+             *      вернуть
+             *          кРазмещению - наСкладе
+             *
+             * @param {object} part - { partId, queryTypeId, queryResult, quantity }
+             * @param {number} orderType
+             * @returns {number} remain
+             */
+            service.addPartToOrder = function(part, orderType) {
+                var warehouseId = service.getWarehouseForOrder(orderType);
+                var inStock = WarehouseStock.get(part.partId, warehouseId, part.isProduce).stock;
+
+                var qty = inStock < part.quantity ? inStock : part.quantity;
+
+                var item = getPart(part.partId);
+
+                if (item === undefined) {
+                    item = {
+                        partId: part.partId,
+                        description: part.description,
+                        price: part.price,
+                        priceRetail: part.priceRetail,
+                        queryTypeId: part.queryTypeId,
+                        queryResult: part.queryResult,
+                        orders: {},
+                        weight: part.weight,
+                        qtyInPack: part.qtyInPack
+                    };
+                    item.orders[orderType] = {}
+                }
+                item.isProduce = part.isProduce,
+                    // console.log(item);
+                    item.orders[orderType] = qty;
+                if (qty > 0) {
+                    delete item.isDeleted;
+                }
+
+                setPart(part.partId, item);
+
+                return part.quantity - inStock;
+            };
+
+            /**
+             * @returns {boolean}
+             */
+            service.isFedFromMoscow = function () {
+                var fedFromMoscow = [
+                    Conf.warehouseSpb,
+                    Conf.warehouseKrasnodar,
+                    Conf.warehouseEkb
+                ];
+
+                return fedFromMoscow.indexOf(User.get().warehouseId) > -1;
+            };
+
+            service.getWarehouseForOrder = function (orderType) {
+                switch (orderType) {
+                    case Conf.orderTypeInStock:
+                        return User.get().warehouseId;
+                    case Conf.orderTypeMoscow:
+                        return Conf.warehouseMoscow;
+                    case Conf.orderTypeSgp:
+                        return Conf.warehouseSgp;
+                    case Conf.orderTypeFactory:
+                        return Conf.warehouseFactory;
+                }
+            };
+
+            return service;
+
+            function getPart(partId) {
+                var cart = GlobalStorage.local().optCart || {parts: {}};
+
+                return cart.parts[partId];
+            }
+
+            function setPart(partId, item) {
+                var gl = GlobalStorage.local();
+                var cart = gl.optCart || {};
+                if (cart.parts === undefined) {
+                    cart.parts = {};
+                }
+
+                cart.parts[partId] = item;
+                gl.optCart = cart;
+                GlobalStorage.local(gl);
+            }
+        }
+    ]);
+
+})();
