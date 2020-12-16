@@ -16,11 +16,10 @@ class RepairActivity extends Model
         'repair_id',
         'department_id',
         'type_id',
-        'created_by',
-        'remarks'
+        'created_by'
     ];
 
-    public function case()
+    public function repair()
     {
         return $this->belongsTo(Repair::class);
     }
